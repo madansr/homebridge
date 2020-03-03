@@ -1,0 +1,229 @@
+#!/usr/bin/env node
+
+const os = require('os');
+const fs = require('fs');
+const path = require('path');
+const child_process = require('child_process');
+
+const ora = require('ora');
+const chalk = require('chalk');
+const semver = require('semver');
+const prompts = require('prompts');
+const tcpPortUsed = require('tcp-port-used');
+
+function displaySetupInstructions() {
+  console.log(chalk.cyan('\nSetup Homebridge as a service anytime by running the'), chalk.bold('homebridge setup'), chalk.cyan('command.'), '\n');
+  process.exit(0);
+}
+
+async function promptForService() {
+  const response = await prompts({
+    type: 'confirm',
+    name: 'enableService',
+    message: 'Would you like to setup Homebridge as a service?',
+    initial: false
+  });
+  return response.enableService;
+}
+
+async function promptForPort() {
+  let response = await prompts({
+    type: 'number',
+    name: 'uiPort',
+    message: 'What port should the Homebridge Web UI Run on?',
+    initial: 8581,
+    validate: value => (parseInt(value) < 1025 || parseInt(value) > 65535) ? `Port must be between 1025 and 65535.` : true,
+  });
+
+  if (!response.uiPort) {
+    return displaySetupInstructions();
+  }
+
+  if (await tcpPortUsed.check(response.uiPort)) {
+    console.log(chalk.red(`Port ${response.uiPort} is already in use. Please enter a different port.`));
+    return await promptForPort();
+  }
+
+  return response.uiPort;
+}
+
+async function promptForUser() {
+  let response = await prompts({
+    type: 'text',
+    name: 'user',
+    message: 'Which user account should the Homebridge service run as?',
+    initial: 'homebridge',
+    validate: value => value.match(/[ `!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?~]/) ? `Account name must not contain any special characters or spaces.`: true
+  });
+
+  if (!response.user) {
+    return displaySetupInstructions();
+  }
+
+  return response.user;
+}
+
+function getNpmGlobalModulesDirectory() {
+  const npmPrefix = child_process.execSync('npm -g prefix').toString('utf8').trim();
+  return os.platform() === 'win32' ? path.join(npmPrefix, 'node_modules') : path.join(npmPrefix, 'lib', 'node_modules');
+}
+
+async function installUi(){
+  return new Promise((resolve) => {
+    const spinner = ora({
+      text: 'Installing dependencies...',
+      spinner: 'toggle9'
+    }).start();
+
+    // get npm prefix
+    const globalModulesDir = getNpmGlobalModulesDirectory();
+
+    // check if homebridge-config-ui-x is already installed
+    if (fs.existsSync(path.resolve(globalModulesDir, 'homebridge-config-ui-x'))) {
+      spinner.succeed();
+      return resolve();
+    }
+
+    // check for write access to global bin path
+    if (os.platform() !== 'win32') {
+      const binPath = path.resolve(globalModulesDir, '../..', 'bin');
+      try {
+        fs.accessSync(binPath, fs.constants.R_OK | fs.constants.W_OK)
+      } catch (e) {
+        spinner.fail(chalk.red(`Write permissions on "${binPath}" required to install dependencies.`));
+        if (os.platform() !== 'win32') {
+          console.log(chalk.cyan('\nTry running with "sudo":'), chalk.bold('sudo homebridge setup'), '\n');
+        }
+        process.exit(0);
+      }
+    }
+
+    // check for write access to global modules path
+    try {
+      fs.accessSync(globalModulesDir, fs.constants.R_OK | fs.constants.W_OK)
+    } catch (e) {
+      spinner.fail(chalk.red(`Write permissions on "${globalModulesDir}" required to install dependencies.`));
+      if (os.platform() !== 'win32') {
+        console.log(chalk.cyan('\nTry running with "sudo":'), chalk.bold('sudo homebridge setup'), '\n');
+      }
+      process.exit(0);
+    }
+
+    // install dependencies
+    child_process.exec('npm install -g --unsafe-perm homebridge-config-ui-x@latest', (err, stdout, stderr) => {
+      if (err) {
+        spinner.fail('Failed to install UI - see error below:');
+        console.error(stderr);
+        process.exit(0);
+      } else {
+        spinner.succeed()
+        return resolve();
+      }
+    });
+
+  });
+}
+
+async function setupService(port, user) {
+  return new Promise((resolve) => {
+    const spinner = ora({
+      text: 'Setting up Homebridge as a service...\n',
+      spinner: 'toggle9'
+    }).start();
+
+    // get npm prefix
+    const globalModulesDir = getNpmGlobalModulesDirectory();
+
+    let hbServiceBinary = 'hb-service';
+    if (fs.existsSync(path.resolve(globalModulesDir, 'homebridge-config-ui-x/dist/bin/hb-service.js'))) {
+      hbServiceBinary = path.resolve(globalModulesDir, 'homebridge-config-ui-x/dist/bin/hb-service.js');
+    }
+
+    spinner.stopAndPersist();
+    
+    // get the service setup command
+    let setupCommand;
+    switch(os.platform()) {
+      case 'linux':
+        console.log('Please enter sudo password if prompted...');
+        setupCommand = ['sudo', ['-k', process.execPath, hbServiceBinary, 'install', '--port', port, '--user', user, '--disable-log-prefix']];
+        break;
+      case 'darwin':
+        console.log('Please enter sudo password if prompted...');
+        setupCommand = ['sudo', ['-k', process.execPath, hbServiceBinary, 'install', '--port', port, '--disable-log-prefix']];
+        break;
+      case 'win32': 
+        setupCommand = [process.execPath, [hbServiceBinary, 'install', '--port', port, '--disable-log-prefix']];
+        break;
+    }
+
+    // run the service setup command
+    const serviceSetup = child_process.spawn(...setupCommand, {
+      stdio: 'pipe'
+    });
+
+    serviceSetup.stderr.on('data', (data) => {
+      process.stderr.write(data);
+    });
+
+    serviceSetup.stdout.on('data', (data) => {
+      process.stdout.write(data);
+    });
+
+    serviceSetup.on('close', (code) => {
+      if (code !== 0) {
+        spinner.fail('Failed to setup Homebridge service.');
+        process.exit(0);
+      }
+
+      spinner.succeed('Homebridge Setup Complete');
+      return resolve();
+    })
+  });
+}
+
+(async () => {
+  // check the Node.js version is something recent
+  if (semver.lt(process.version, 'v10.0.0')) {
+    console.log(chalk.yellow('Homebridge recommends Node.js v10.0.0 or greater, you are currently running', process.version + '.'));
+    process.exit(0);
+  }
+
+  // check supported os for automatic install
+  if (!['darwin', 'win32', 'linux'].includes(os.platform())) {
+    console.log('Homebridge postinstall script is not supported on', os.platform() + '.');
+    process.exit(0);
+  }
+
+  // check if this is running in a non-interative terminal
+  if (!process.stdin.isTTY || process.env.DEBIAN_FRONTEND === 'noninteractive') {
+    return displaySetupInstructions();
+  }
+
+  // only run this script if homebridge was installed as a global module
+  if (process.env.npm_config_global !== 'true') {
+    console.log(chalk.yellow('Install Homebridge as a global npm module to setup as a service.'), '\n')
+    process.exit(0);
+  }
+
+  // check unsafe mode was used if it is a global install
+  if (process.env.npm_config_global === 'true' && process.env.npm_config_unsafe_perm !== 'true') {
+    return displaySetupInstructions();
+  }
+
+  // ask the user if they want to install homebridge as a service
+  if (!await promptForService()) {
+    return displaySetupInstructions();
+  }
+
+  // linux only: ask the user which user account the service should run as
+  const user = (os.platform() === 'linux') ? await promptForUser() : undefined;
+
+  // as the user which port the UI should run on
+  const port = await promptForPort();
+
+  await installUi();
+  await setupService(port, user);
+
+  console.log(chalk.cyan('\nUse the'), chalk.bold('hb-service'), chalk.cyan('command restart, stop, start, view logs and create additional instances or remove the created service.'), '\n');
+})();
