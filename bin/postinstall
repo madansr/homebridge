@@ -159,15 +159,7 @@ async function setupService(port, user) {
 
     // run the service setup command
     const serviceSetup = child_process.spawn(...setupCommand, {
-      stdio: 'pipe'
-    });
-
-    serviceSetup.stderr.on('data', (data) => {
-      process.stderr.write(data);
-    });
-
-    serviceSetup.stdout.on('data', (data) => {
-      process.stdout.write(data);
+      stdio: 'inherit'
     });
 
     serviceSetup.on('close', (code) => {
@@ -176,7 +168,7 @@ async function setupService(port, user) {
         process.exit(0);
       }
 
-      spinner.succeed('Homebridge Setup Complete');
+      spinner.clear();
       return resolve();
     })
   });
